@@ -1,227 +1,92 @@
-import { useState, useEffect } from 'react';
-import { Audio } from 'expo-av';
-import { View, Button, Text, StyleSheet, TouchableOpacity } from 'react-native';
-import Slider from '@react-native-community/slider';
-// import { Pause, Play } from 'lucide-react-native';
-import { Ionicons } from '@expo/vector-icons';
+import React, { useState, useEffect } from 'react';
+import { View, Button, Text, Alert, Platform, PermissionsAndroid } from 'react-native';
+import AudioRecord from 'react-native-audio-record';
+import type * as FileSystemType from 'expo-file-system';
+import * as DevClient from 'expo-dev-client';
 
+export default function AudioRecorderScreen() {
+  const [isRecording, setIsRecording] = useState(false);
+  const [audioFile, setAudioFile] = useState('');
+  const [audioData, setAudioData] = useState('');
+  const FileSystem = require('expo-file-system') as typeof FileSystemType;
 
-export default function RecordingScreen() {
-    const [recording, setRecording] = useState<Audio.Recording | null>(null);
-    const [sound, setSound] = useState<Audio.Sound | null>(null);
-    const [isRecording, setIsRecording] = useState(false);
-    const [recordingUri, setRecordingUri] = useState<string | null>(null);
-    const [isPlaying, setIsPlaying] = useState(false);
-    const [duration, setDuration] = useState(0);
-    const [position, setPosition] = useState(0);
+  useEffect(() => {
+    // 配置錄音選項
+    const options = {
+      sampleRate: 16000,  // 採樣率
+      channels: 1,        // 通道數 (1 = 單聲道, 2 = 立體聲)
+      bitsPerSample: 16,  // 位元深度
+      audioSource: 6,     // Android only (see AudioSource)
+      wavFile: 'test.wav' // 檔案名稱
+    };
 
-    //初始化
-    useEffect(() => {
-        const init = async () => {
-            try {
-              await Audio.setAudioModeAsync({
-                allowsRecordingIOS: true,
-                playsInSilentModeIOS: true,
-              });
-            } catch (error) {
-              console.error('無法初始化音訊:', error);
-            }
-          };
+    AudioRecord.init(options);
 
-          init();
+    // 監聽錄音數據
+    AudioRecord.on('data', data => {
+      // 可以在這裡處理實時音頻數據
+      setAudioData(prevData => prevData + data);
+    });
 
-          //清理值
-          return () => {
-            if (recording) {
-              recording.stopAndUnloadAsync();
-            }
-            if (sound) {
-              sound.unloadAsync();
-            }
-          };
-    }, []);
+    requestPermission();
 
-    // 格式化時間
-    const formatTime = (milliseconds: number) => {
-      const totalSeconds = Math.floor(milliseconds / 1000);
-      const minutes = Math.floor(totalSeconds / 60);
-      const seconds = totalSeconds % 60;
-      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-  };
+    return () => {
+      // 組件卸載時停止錄音
+      if (isRecording) {
+        AudioRecord.stop();
+      }
+    };
+  }, []);
 
-
-    //錄音按鈕
-    const handleRecordPress = async () => {
+  const requestPermission = async () => {
+    if (Platform.OS === 'android') {
       try {
-        // 只在用戶點擊錄音按鈕時才請求權限
-        const { status } = await Audio.requestPermissionsAsync();
-        
-        if (status === 'granted') {
-          const { recording } = await Audio.Recording.createAsync(
-              Audio.RecordingOptionsPresets.HIGH_QUALITY
-          );
-          setRecording(recording);
-          setIsRecording(true);
-      } else {
-          alert('需要麥克風權限才能錄音');
-      }
-  } catch (error) {
-      console.error('錄音失敗:', error);
-      alert('錄音失敗，請檢查麥克風權限');
-  }
-    };
+        const grants = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+          PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        ]);
 
-    //暫停錄音
-    const stopRecording = async () => {
-        if (!recording) 
-            return;
-        try {
-            await recording.stopAndUnloadAsync();
-            const uri = recording.getURI();
-            setRecordingUri(uri || null);
-            setIsRecording(false);
-            setRecording(null);
-          } catch (error) {
-            console.error('停止錄音失敗:', error);
-          }
-    };
-
-    // 更新播放進度
-    const updatePlaybackStatus = async (status: any) => {
-      if (status.isLoaded) {
-          setPosition(status.positionMillis);
-          setDuration(status.durationMillis);
-          setIsPlaying(status.isPlaying);
-
-          if (status.didJustFinish) {
-              setIsPlaying(false);
-              setPosition(0);
-          }
-      }
-  };
-
-    //播放音頻
-    const playSound = async () => {
-        if (!recordingUri) return;
-    
-        try {
-          if (sound) {
-            const status = await sound.getStatusAsync();
-            if (status.isLoaded) {
-                if (status.isPlaying) {
-                    await sound.pauseAsync();
-                } else {
-                    await sound.playAsync();
-                }
-                return;
-            }
-          }
-          const { sound: newSound } = await Audio.Sound.createAsync(
-            { uri: recordingUri },
-            { progressUpdateIntervalMillis: 100 },
-            updatePlaybackStatus
-          );
-          
-          setSound(newSound);
-          await newSound.playAsync();
-        } catch (error) {
-          console.error('播放錄音失敗:', error);
-          alert('播放錄音時發生錯誤');
+        if (
+          grants['android.permission.WRITE_EXTERNAL_STORAGE'] === PermissionsAndroid.RESULTS.GRANTED &&
+          grants['android.permission.READ_EXTERNAL_STORAGE'] === PermissionsAndroid.RESULTS.GRANTED &&
+          grants['android.permission.RECORD_AUDIO'] === PermissionsAndroid.RESULTS.GRANTED
+        ) {
+          console.log('所有權限已獲得');
+        } else {
+          console.log('未獲得所有權限');
         }
-    };
-
-     // 處理進度條變化
-     const onSeekSliderValueChange = async (value: number) => {
-      if (sound) {
-          await sound.setPositionAsync(value);
+      } catch (err) {
+        console.warn(err);
       }
+    }
   };
 
-    //回傳值
-    return (
-        <View style={styles.container}>
-            <Text style={styles.title}>
-                {isRecording ? '正在錄音...' : '準備錄音'}   
-            </Text>
+  const startRecording = () => {
+    setAudioData('');
+    AudioRecord.start();
+    setIsRecording(true);
+    console.log('開始錄音');
+  };
 
-            <View style={styles.buttonContainer}>
-                {!isRecording ? (
-                    <Button title="開始錄音" onPress={handleRecordPress} color="#4CAF50"/>
-                ) : (
-                    <Button title="停止錄音" onPress={stopRecording} color="#f44336"/>
+  const stopRecording = async () => {
+    if (!isRecording) return;
+    
+    const audioFile = await AudioRecord.stop();
+    setAudioFile(audioFile);
+    setIsRecording(false);
+    console.log('錄音結束，文件保存在:', audioFile);
+  };
 
-                )}
-            </View>
-            
-            {recordingUri && (
-                <View style={styles.playbackContainer}>
-                    <TouchableOpacity 
-                        style={styles.playButton} 
-                        onPress={playSound}
-                    >
-                        {isPlaying ? (
-                            <Ionicons name="pause" size={24} color="#2196F3" />
-                        ) : (
-                          <Ionicons name="play" size={24} color="#2196F3" />
-                        )}
-                    </TouchableOpacity>
-
-                    <View style={styles.sliderContainer}>
-                        <Slider
-                            style={styles.slider}
-                            minimumValue={0}
-                            maximumValue={duration}
-                            value={position}
-                            onSlidingComplete={onSeekSliderValueChange}
-                            minimumTrackTintColor="#2196F3"
-                            maximumTrackTintColor="#000000"
-                        />
-                        <View style={styles.timeContainer}>
-                            <Text>{formatTime(position)}</Text>
-                            <Text>{formatTime(duration)}</Text>
-                        </View>
-                    </View>
-                </View>
-            )}
-        </View>
-    );
+  return (
+    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+    <Text>錄音狀態: {isRecording ? '錄音中' : '未錄音'}</Text>
+    {audioFile ? <Text>錄音文件: {audioFile}</Text> : null}
+    
+    <Button 
+      title={isRecording ? "停止錄音" : "開始錄音"} 
+      onPress={isRecording ? stopRecording : startRecording} 
+    />
+  </View>
+  );
 }
-
-const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-        justifyContent: 'center',
-        alignItems: 'center',
-        padding: 20,
-    },
-    title: {
-        fontSize: 24,
-        marginBottom: 30,
-    },
-    buttonContainer: {
-        marginVertical: 10,
-        minWidth: 200,
-    },
-    playbackContainer: {
-      width: '100%',
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingHorizontal: 20,
-      marginTop: 20,
-  },
-  playButton: {
-      padding: 10,
-  },
-  sliderContainer: {
-      flex: 1,
-      marginLeft: 10,
-  },
-  slider: {
-      width: '100%',
-  },
-  timeContainer: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      paddingHorizontal: 5,
-  },
-});

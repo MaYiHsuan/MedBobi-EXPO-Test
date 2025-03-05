@@ -5,6 +5,8 @@ import { ThemedText } from '@/components/ThemedText';
 import { ThemedView } from '@/components/ThemedView';
 
 export default function NotFoundScreen() {
+  console.log('NotFoundScreen rendered'); // 加入這行來查看組件是否被渲染
+  
   return (
     <>
       <Stack.Screen options={{ title: 'Oops!' }} />
