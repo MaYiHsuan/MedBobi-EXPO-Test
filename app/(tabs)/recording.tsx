@@ -1,10 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, TouchableOpacity, Text, Alert, Platform, PermissionsAndroid, StyleSheet } from 'react-native';
+import { View, TouchableOpacity, Text, Alert, Platform, PermissionsAndroid, StyleSheet, AppState, AppStateStatus } from 'react-native';
 import AudioRecord from 'react-native-audio-record';
 import Sound from 'react-native-sound';
 import * as FileSystem from 'expo-file-system';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import Slider from '@react-native-community/slider';
+import BackgroundTimer from 'react-native-background-timer';
+import PushNotification from 'react-native-push-notification';
+import ForegroundService from 'react-native-foreground-service';
+const { startService, stopService } = ForegroundService;
 
 export default function AudioRecorderScreen() {
   const [isRecording, setIsRecording] = useState(false);
@@ -13,13 +17,16 @@ export default function AudioRecorderScreen() {
   const [hasRecording, setHasRecording] = useState(false);
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
+  const [recordingDuration, setRecordingDuration] = useState(0);
   
   // 使用 useRef 來保存 Sound 對象，確保它在組件重新渲染時不會丟失
   const sound = useRef<Sound | null>(null);
-  const playbackTimer = useRef<NodeJS.Timeout | null>(null);
+  const playbackTimer = useRef<number | null>(null);
+  const recordingTimer = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
 
   useEffect(() => {
-    // 啟用 Sound 庫的錯誤日誌
+    setupNotifications();
     Sound.setCategory('Playback');
     
     // 設置音頻錄製選項 - 使用臨時目錄
@@ -39,10 +46,12 @@ export default function AudioRecorderScreen() {
     // 請求權限
     requestPermission();
 
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+
     // 組件卸載時清理
     return () => {
       if (isRecording) {
-        AudioRecord.stop();
+        stopRecordingInternal();
       }
       
       if (sound.current) {
@@ -50,13 +59,84 @@ export default function AudioRecorderScreen() {
       }
       
       if (playbackTimer.current) {
-        clearInterval(playbackTimer.current);
+        BackgroundTimer.clearInterval(playbackTimer.current);
+      }
+
+      if (recordingTimer.current) {
+        BackgroundTimer.clearInterval(recordingTimer.current);
       }
       
       // 清理臨時文件
       cleanupTempFile();
+
+      subscription.remove();
+
+      if (Platform.OS === 'android') {
+        stopService();
+      }
     };
   }, []);
+
+  const setupNotifications = () => {
+    PushNotification.configure({
+      onNotification: function (notification) {
+        console.log('NOTIFICATION:', notification);
+      },
+      popInitialNotification: true,
+      requestPermissions: Platform.OS === 'ios',
+    });
+
+    PushNotification.createChannel(
+      {
+        channelId: 'recording-channel',
+        channelName: 'Recording Channel',
+        channelDescription: 'Channel for recording notifications',
+        playSound: false,
+        vibrate: false,
+      },
+      (created) => console.log(`Channel created: ${created}`)
+    );
+  };
+
+  const handleAppStateChange = (nextAppState: AppStateStatus) => {
+    if (isRecording && appState.current.match(/active/) && nextAppState.match(/inactive|background/)) {
+      // 應用進入背景，確保錄音繼續
+      showRecordingNotification();
+    } else if (isRecording && appState.current.match(/inactive|background/) && nextAppState === 'active') {
+      // 應用回到前台
+      PushNotification.cancelAllLocalNotifications();
+    }
+    
+    appState.current = nextAppState;
+  };
+
+  const showRecordingNotification = () => {
+    PushNotification.localNotification({
+      channelId: 'recording-channel',
+      title: '錄音進行中',
+      message: `已錄製 ${formatTime(recordingDuration)}`,
+      ongoing: true,
+      autoCancel: false,
+      id: 1001,
+    });
+  };
+
+  const startForegroundService = async () => {
+    if (Platform.OS !== 'android') return;
+    
+    await ForegroundService.startService({
+      id: 1244,
+      title: '錄音進行中',
+      message: '點擊返回應用',
+      icon: 'ic_launcher',
+    });
+  };
+
+  const stopForegroundService = () => {
+    if (Platform.OS !== 'android') return;
+    
+    ForegroundService.stopService();
+  };
 
   const requestPermission = async () => {
     if (Platform.OS === 'android') {
@@ -90,12 +170,39 @@ export default function AudioRecorderScreen() {
     }
     
     try {
+      if (Platform.OS === 'android') {
+        await startForegroundService();
+      }
+      
       AudioRecord.start();
       setIsRecording(true);
+      setRecordingDuration(0);
+
+      recordingTimer.current = BackgroundTimer.setInterval(() => {
+        setRecordingDuration(prev => {
+          const newDuration = prev + 1;
+          
+          // 如果應用在背景，更新通知
+          if (appState.current.match(/inactive|background/)) {
+            PushNotification.localNotification({
+              channelId: 'recording-channel',
+              title: '錄音進行中',
+              message: `已錄製 ${formatTime(newDuration)}`,
+              ongoing: true,
+              autoCancel: false,
+              id: 1001,  // 使用相同的 ID 來更新同一個通知
+            });
+          }
+          
+          return newDuration;
+        });
+      }, 1000);
+
       console.log('開始錄音');
     } catch (error) {
       console.error('開始錄音失敗:', error);
       Alert.alert('錄音錯誤', '無法開始錄音');
+      stopForegroundService();
     }
   };
 
@@ -103,15 +210,34 @@ export default function AudioRecorderScreen() {
     if (!isRecording) return;
     
     try {
-      const audioFile = await AudioRecord.stop();
+      const audioFile = await stopRecordingInternal();
       setAudioFile(audioFile);
-      setIsRecording(false);
       setHasRecording(true);
       console.log('錄音結束，文件保存在:', audioFile);
     } catch (error) {
       console.error('停止錄音失敗:', error);
       Alert.alert('錄音錯誤', '停止錄音時出錯');
     }
+  };
+
+  const stopRecordingInternal = async () => {
+    // 停止前台服務
+    stopForegroundService();
+    
+    // 取消通知
+    PushNotification.cancelAllLocalNotifications();
+    
+    // 停止錄音計時器
+    if (recordingTimer.current) {
+      BackgroundTimer.clearInterval(recordingTimer.current);
+      recordingTimer.current = null;
+    }
+    
+    // 停止錄音
+    const audioFile = await AudioRecord.stop();
+    setIsRecording(false);
+    
+    return audioFile;
   };
 
   const playRecording = () => {
@@ -155,7 +281,7 @@ export default function AudioRecorderScreen() {
       });
       
       // 設置進度條更新計時器
-      playbackTimer.current = setInterval(() => {
+      playbackTimer.current = BackgroundTimer.setInterval(() => {
         if (sound.current) {
           sound.current.getCurrentTime((seconds) => {
             setPlaybackProgress(seconds);
@@ -173,7 +299,7 @@ export default function AudioRecorderScreen() {
       
       // 清除進度條計時器
       if (playbackTimer.current) {
-        clearInterval(playbackTimer.current);
+        BackgroundTimer.clearInterval(playbackTimer.current);
         playbackTimer.current = null;
       }
     }
@@ -195,7 +321,7 @@ export default function AudioRecorderScreen() {
     
     // 清除進度條計時器
     if (playbackTimer.current) {
-      clearInterval(playbackTimer.current);
+      BackgroundTimer.clearInterval(playbackTimer.current);
       playbackTimer.current = null;
     }
     
@@ -233,7 +359,11 @@ export default function AudioRecorderScreen() {
   return (
     <View style={styles.container}>
       <Text style={styles.statusText}>
-        狀態: {isRecording ? '錄音中' : isPlaying ? '播放中' : '就緒'}
+        {isRecording 
+          ? `錄音中: ${formatTime(recordingDuration)}` 
+          : isPlaying 
+            ? '播放中' 
+            : '就緒'}
       </Text>
       
       <View style={styles.recordButtonContainer}>
@@ -297,6 +427,10 @@ export default function AudioRecorderScreen() {
           </TouchableOpacity>
         </View>
       )}
+      
+      <Text style={styles.backgroundNote}>
+        {isRecording ? "錄音將在背景繼續進行" : ""}
+      </Text>
     </View>
   );
 }
@@ -380,4 +514,9 @@ const styles = StyleSheet.create({
     width: 40,
     textAlign: 'center',
   },
+  backgroundNote: {
+    marginTop: 20,
+    color: '#666',
+    fontStyle: 'italic',
+  }
 });
