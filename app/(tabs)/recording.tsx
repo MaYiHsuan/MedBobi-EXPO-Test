@@ -1,352 +1,233 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, TouchableOpacity, Text, Alert, Platform, PermissionsAndroid, StyleSheet, AppState, AppStateStatus } from 'react-native';
-import AudioRecord from 'react-native-audio-record';
-import Sound from 'react-native-sound';
-import * as FileSystem from 'expo-file-system';
-import { IconSymbol } from '@/components/ui/IconSymbol';
+import { View, TouchableOpacity, Text, Alert, Platform, StyleSheet, AppState, AppStateStatus, Switch, ScrollView } from 'react-native';
 import Slider from '@react-native-community/slider';
-import BackgroundTimer from 'react-native-background-timer';
-import PushNotification from 'react-native-push-notification';
-import ForegroundService from 'react-native-foreground-service';
-const { startService, stopService } = ForegroundService;
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import AudioRecordManager from '@/services/AudioRecordManager';
+import NotificationService from '@/services/NotificationService';
+import WebSocketService, { WebSocketStatus } from '@/services/WebSocketService';
 
 export default function AudioRecorderScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [audioFile, setAudioFile] = useState('');
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [hasRecording, setHasRecording] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
-  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [recognizedText, setRecognizedText] = useState('');
+  const [webSocketStatus, setWebSocketStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected');
+  const [useWebSocket, setUseWebSocket] = useState(true);
   
-  // 使用 useRef 來保存 Sound 對象，確保它在組件重新渲染時不會丟失
-  const sound = useRef<Sound | null>(null);
-  const playbackTimer = useRef<number | null>(null);
-  const recordingTimer = useRef<number | null>(null);
-  const appState = useRef(AppState.currentState);
-
+  const scrollViewRef = useRef<ScrollView>(null);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isInitializedRef = useRef(false);
+  
+  // 初始化 AudioRecordManager 和 WebSocket
   useEffect(() => {
-    setupNotifications();
-    Sound.setCategory('Playback');
+    if (isInitializedRef.current) return;
     
-    // 設置音頻錄製選項 - 使用臨時目錄
-    const options = {
-      sampleRate: 44100,
-      channels: 1,
-      bitsPerSample: 16,
-      wavFile: 'temp_recording.wav',
-      audioSource: 6, // MIC
-      outputFormat: 2, // AAC_ADTS
-      audioEncoder: 3 // AAC
-    };
+    isInitializedRef.current = true;
+    
+    // 初始化音訊管理器
+    AudioRecordManager.initialize({
+      onRecordingStatusChange: (status) => {
+        console.log("錄音狀態變更:", status);
+        setIsRecording(status.isRecording);
+        
+        if (status.isRecording) {
+          // 開始錄音計時器
+          startRecordingTimer();
+          
+          // 如果啟用 WebSocket，建立連接並開始傳輸
+          if (useWebSocket && webSocketStatus !== 'connected') {
+            connectWebSocket();
+          }
+        } else {
+          // 停止錄音計時器
+          stopRecordingTimer();
+          
+          // 如果啟用了 WebSocket，停止錄音時設置轉錄狀態為 true
+          if (useWebSocket) {
+            setIsTranscribing(true);
+          }
+        }
+      },
+      onPlaybackStatusChange: (status) => {
+        setIsPlaying(status.isPlaying);
+        setPlaybackProgress(status.currentPosition);
+      },
+      onRecordingAvailable: (available) => {
+        setHasRecording(available);
+        if (available) {
+          const duration = AudioRecordManager.getAudioDuration();
+          setAudioDuration(duration);
+        } else {
+          setAudioDuration(0);
+          setPlaybackProgress(0);
+        }
+      },
+      onRecordingData: (audioData) => {
+        // 如果啟用 WebSocket 且已連接，發送音訊數據
+        if (useWebSocket && webSocketStatus === 'connected' && isRecording) {
+          WebSocketService.sendAudioData(audioData);
+        }
+      },
+    });
 
-    // 初始化錄音機
-    AudioRecord.init(options);
-
-    // 請求權限
-    requestPermission();
-
-    const subscription = AppState.addEventListener('change', handleAppStateChange);
-
+    // 設置 WebSocket 回調
+    WebSocketService.setCallbacks({
+      onOpen: () => {
+        console.log('WebSocket 已連接');
+        setWebSocketStatus('connected');
+      },
+      onClose: () => {
+        console.log('WebSocket 已關閉');
+        setWebSocketStatus('disconnected');
+      },
+      onError: (error: any) => {
+        console.error('WebSocket 錯誤:', error);
+        setWebSocketStatus('error');
+      },
+      onMessage: (data: any) => {
+        console.log('收到識別結果:', data);
+        
+        // 假設後端返回的是文字字符串
+        if (typeof data === 'string') {
+          setRecognizedText(prevText => {
+            // 將新識別的文字添加到現有文字後面
+            const newText = prevText ? `${prevText} ${data}` : data;
+            
+            // 使用 setTimeout 確保在狀態更新後滾動到底部
+            setTimeout(() => {
+              scrollViewRef.current?.scrollToEnd({ animated: true });
+            }, 100);
+            
+            return newText;
+          });
+        }
+        
+        // 收到識別結果後，設置轉錄狀態為 false
+        setIsTranscribing(false);
+      }
+    });
+    
     // 組件卸載時清理
     return () => {
-      if (isRecording) {
-        stopRecordingInternal();
-      }
-      
-      if (sound.current) {
-        sound.current.release();
-      }
-      
-      if (playbackTimer.current) {
-        BackgroundTimer.clearInterval(playbackTimer.current);
-      }
-
-      if (recordingTimer.current) {
-        BackgroundTimer.clearInterval(recordingTimer.current);
-      }
-      
-      // 清理臨時文件
-      cleanupTempFile();
-
-      subscription.remove();
-
-      if (Platform.OS === 'android') {
-        stopService();
-      }
+      stopRecordingTimer();
+      disconnectWebSocket();
+      AudioRecordManager.cleanup();
     };
-  }, []);
-
-  const setupNotifications = () => {
-    PushNotification.configure({
-      onNotification: function (notification) {
-        console.log('NOTIFICATION:', notification);
-      },
-      popInitialNotification: true,
-      requestPermissions: Platform.OS === 'ios',
-    });
-
-    PushNotification.createChannel(
-      {
-        channelId: 'recording-channel',
-        channelName: 'Recording Channel',
-        channelDescription: 'Channel for recording notifications',
-        playSound: false,
-        vibrate: false,
-      },
-      (created) => console.log(`Channel created: ${created}`)
-    );
-  };
-
-  const handleAppStateChange = (nextAppState: AppStateStatus) => {
-    if (isRecording && appState.current.match(/active/) && nextAppState.match(/inactive|background/)) {
-      // 應用進入背景，確保錄音繼續
-      showRecordingNotification();
-    } else if (isRecording && appState.current.match(/inactive|background/) && nextAppState === 'active') {
-      // 應用回到前台
-      PushNotification.cancelAllLocalNotifications();
+  }, []); // 移除依賴項，只在組件掛載時執行一次
+  
+  // 監聽 useWebSocket 變化
+  useEffect(() => {
+    if (useWebSocket) {
+      // 如果啟用 WebSocket 且正在錄音，建立連接
+      if (isRecording && webSocketStatus === 'disconnected') {
+        connectWebSocket();
+      }
+    } else {
+      // 如果禁用 WebSocket，關閉連接
+      disconnectWebSocket();
     }
+  }, [useWebSocket, isRecording, webSocketStatus]);
+
+  const startRecordingTimer = () => {
+    setRecordingDuration(0);
+    stopRecordingTimer();
     
-    appState.current = nextAppState;
+    recordingTimerRef.current = setInterval(() => {
+      setRecordingDuration(prev => prev + 1);
+    }, 1000);
   };
 
-  const showRecordingNotification = () => {
-    PushNotification.localNotification({
-      channelId: 'recording-channel',
-      title: '錄音進行中',
-      message: `已錄製 ${formatTime(recordingDuration)}`,
-      ongoing: true,
-      autoCancel: false,
-      id: 1001,
-    });
+  const stopRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
   };
 
-  const startForegroundService = async () => {
-    if (Platform.OS !== 'android') return;
-    
-    await ForegroundService.startService({
-      id: 1244,
-      title: '錄音進行中',
-      message: '點擊返回應用',
-      icon: 'ic_launcher',
-    });
-  };
-
-  const stopForegroundService = () => {
-    if (Platform.OS !== 'android') return;
-    
-    ForegroundService.stopService();
-  };
-
-  const requestPermission = async () => {
-    if (Platform.OS === 'android') {
+  const connectWebSocket = async (): Promise<boolean> => {
+    if (webSocketStatus === 'disconnected' || webSocketStatus === 'error') {
+      console.log('嘗試連接 WebSocket...');
+      setWebSocketStatus('connecting');
       try {
-        const grants = await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
-          PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
-          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        ]);
-
-        if (
-          grants['android.permission.WRITE_EXTERNAL_STORAGE'] === PermissionsAndroid.RESULTS.GRANTED &&
-          grants['android.permission.READ_EXTERNAL_STORAGE'] === PermissionsAndroid.RESULTS.GRANTED &&
-          grants['android.permission.RECORD_AUDIO'] === PermissionsAndroid.RESULTS.GRANTED
-        ) {
-          console.log('所有權限已獲得');
-        } else {
-          Alert.alert('權限錯誤', '需要錄音和存儲權限才能使用此功能');
-        }
-      } catch (err) {
-        console.warn('權限請求錯誤:', err);
-        Alert.alert('權限錯誤', '請求權限時出錯');
+        await WebSocketService.connect();
+        console.log('WebSocket 連接成功');
+        setWebSocketStatus('connected');
+        return true;
+      } catch (error) {
+        console.error('WebSocket 連接失敗:', error);
+        setWebSocketStatus('error');
+        return false;
       }
     }
+    return webSocketStatus === 'connected';
   };
 
   const startRecording = async () => {
-    // 如果有現有錄音，先清理
-    if (hasRecording) {
-      cleanupRecording();
+    console.log('嘗試開始錄音...');
+    
+    // 清除之前的識別結果
+    if (useWebSocket) {
+      setRecognizedText('');
+      
+      // 如果啟用 WebSocket，確保已連接
+      if (webSocketStatus !== 'connected') {
+        if (webSocketStatus === 'connecting') {
+          Alert.alert('請稍候', 'WebSocket 正在連接中，請等待連接完成後再試。');
+          return;
+        }
+        
+        // 嘗試連接 WebSocket
+        const connected = await connectWebSocket();
+        if (!connected) {
+          Alert.alert('連接錯誤', '無法連接到語音識別服務，請稍後再試。');
+          return;
+        }
+      }
     }
     
+    // 開始錄音
     try {
-      if (Platform.OS === 'android') {
-        await startForegroundService();
+      // 使用 useWebSocket 參數告訴 AudioRecordManager 是否需要處理 WebSocket 數據
+      const success = await AudioRecordManager.startRecording(useWebSocket);
+      if (!success) {
+        Alert.alert('錯誤', '無法開始錄音');
       }
-      
-      AudioRecord.start();
-      setIsRecording(true);
-      setRecordingDuration(0);
-
-      recordingTimer.current = BackgroundTimer.setInterval(() => {
-        setRecordingDuration(prev => {
-          const newDuration = prev + 1;
-          
-          // 如果應用在背景，更新通知
-          if (appState.current.match(/inactive|background/)) {
-            PushNotification.localNotification({
-              channelId: 'recording-channel',
-              title: '錄音進行中',
-              message: `已錄製 ${formatTime(newDuration)}`,
-              ongoing: true,
-              autoCancel: false,
-              id: 1001,  // 使用相同的 ID 來更新同一個通知
-            });
-          }
-          
-          return newDuration;
-        });
-      }, 1000);
-
-      console.log('開始錄音');
+      console.log('開始錄音結果:', success);
     } catch (error) {
       console.error('開始錄音失敗:', error);
-      Alert.alert('錄音錯誤', '無法開始錄音');
-      stopForegroundService();
+      Alert.alert('錯誤', '無法開始錄音。請確保已授予麥克風權限。');
     }
   };
 
   const stopRecording = async () => {
-    if (!isRecording) return;
-    
+    console.log('嘗試停止錄音...');
     try {
-      const audioFile = await stopRecordingInternal();
-      setAudioFile(audioFile);
-      setHasRecording(true);
-      console.log('錄音結束，文件保存在:', audioFile);
+      await AudioRecordManager.stopRecording();
+      console.log('錄音已停止');
     } catch (error) {
       console.error('停止錄音失敗:', error);
-      Alert.alert('錄音錯誤', '停止錄音時出錯');
     }
-  };
-
-  const stopRecordingInternal = async () => {
-    // 停止前台服務
-    stopForegroundService();
-    
-    // 取消通知
-    PushNotification.cancelAllLocalNotifications();
-    
-    // 停止錄音計時器
-    if (recordingTimer.current) {
-      BackgroundTimer.clearInterval(recordingTimer.current);
-      recordingTimer.current = null;
-    }
-    
-    // 停止錄音
-    const audioFile = await AudioRecord.stop();
-    setIsRecording(false);
-    
-    return audioFile;
   };
 
   const playRecording = () => {
-    if (!audioFile || isPlaying) return;
-    
-    // 釋放之前的 Sound 對象（如果存在）
-    if (sound.current) {
-      sound.current.release();
-    }
-    
-    // 創建新的 Sound 對象
-    sound.current = new Sound(audioFile, '', (error) => {
-      if (error) {
-        console.error('加載音頻失敗:', error);
-        Alert.alert('播放錯誤', '無法加載音頻文件');
-        return;
-      }
-      
-      // 獲取音頻時長
-      const duration = sound.current?.getDuration() || 0;
-      setAudioDuration(duration);
-      
-      // 播放音頻
-      setIsPlaying(true);
-      setPlaybackProgress(0);
-      
-      sound.current?.play((success) => {
-        if (success) {
-          console.log('播放完成');
-        } else {
-          console.log('播放失敗');
-        }
-        setIsPlaying(false);
-        setPlaybackProgress(0);
-        
-        // 清除進度條計時器
-        if (playbackTimer.current) {
-          clearInterval(playbackTimer.current);
-          playbackTimer.current = null;
-        }
-      });
-      
-      // 設置進度條更新計時器
-      playbackTimer.current = BackgroundTimer.setInterval(() => {
-        if (sound.current) {
-          sound.current.getCurrentTime((seconds) => {
-            setPlaybackProgress(seconds);
-          });
-        }
-      }, 100);
-    });
+    AudioRecordManager.playRecording();
   };
 
   const stopPlayback = () => {
-    if (sound.current && isPlaying) {
-      sound.current.stop();
-      setIsPlaying(false);
-      setPlaybackProgress(0);
-      
-      // 清除進度條計時器
-      if (playbackTimer.current) {
-        BackgroundTimer.clearInterval(playbackTimer.current);
-        playbackTimer.current = null;
-      }
-    }
+    AudioRecordManager.stopPlayback();
   };
 
   const seekToPosition = (value: number) => {
-    if (sound.current) {
-      sound.current.setCurrentTime(value);
-    }
+    AudioRecordManager.seekToPosition(value);
   };
 
   const cleanupRecording = () => {
-    // 停止播放
-    if (sound.current) {
-      sound.current.stop();
-      sound.current.release();
-      sound.current = null;
-    }
-    
-    // 清除進度條計時器
-    if (playbackTimer.current) {
-      BackgroundTimer.clearInterval(playbackTimer.current);
-      playbackTimer.current = null;
-    }
-    
-    // 清理臨時文件
-    cleanupTempFile();
-    
-    // 重置狀態
-    setAudioFile('');
-    setHasRecording(false);
-    setIsPlaying(false);
-    setPlaybackProgress(0);
-    setAudioDuration(0);
-  };
-
-  const cleanupTempFile = () => {
-    // 如果有臨時文件，嘗試刪除
-    if (audioFile) {
-      try {
-        // 檢查文件是否存在，然後刪除
-        FileSystem.deleteAsync(audioFile, { idempotent: true })
-          .catch(error => console.log('刪除臨時文件錯誤:', error));
-      } catch (error) {
-        console.log('刪除臨時文件時出錯:', error);
-      }
-    }
+    AudioRecordManager.cleanupRecording();
+    setRecognizedText('');
   };
 
   // 格式化時間為 mm:ss 格式
@@ -354,6 +235,49 @@ export default function AudioRecorderScreen() {
     const min = Math.floor(seconds / 60);
     const sec = Math.floor(seconds % 60);
     return `${min < 10 ? '0' : ''}${min}:${sec < 10 ? '0' : ''}${sec}`;
+  };
+
+  const getWebSocketStatusText = () => {
+    switch (webSocketStatus) {
+      case 'connecting':
+        return '連接中...';
+      case 'connected':
+        return '已連接';
+      case 'disconnected':
+        return '未連接';
+      case 'error':
+        return '連接錯誤';
+      default:
+        return '未知狀態';
+    }
+  };
+
+  const getWebSocketStatusColor = () => {
+    switch (webSocketStatus) {
+      case 'connected':
+        return '#34A853';
+      case 'connecting':
+        return '#FBBC05';
+      case 'error':
+        return '#EA4335';
+      default:
+        return '#9AA0A6';
+    }
+  };
+
+  const disconnectWebSocket = () => {
+    if (webSocketStatus === 'connected') {
+      WebSocketService.disconnect();
+    }
+  };
+
+  const handleRecordButtonPress = async () => {
+    console.log('錄音按鈕被按下，當前錄音狀態:', isRecording);
+    if (isRecording) {
+      await stopRecording();
+    } else {
+      await startRecording();
+    }
   };
 
   return (
@@ -366,18 +290,41 @@ export default function AudioRecorderScreen() {
             : '就緒'}
       </Text>
       
+      {useWebSocket && (
+        <View style={styles.webSocketStatusContainer}>
+          <Text style={styles.webSocketStatusLabel}>WebSocket 狀態:</Text>
+          <View style={[styles.statusIndicator, { backgroundColor: getWebSocketStatusColor() }]} />
+          <Text style={styles.webSocketStatusText}>{getWebSocketStatusText()}</Text>
+        </View>
+      )}
+      
+      <View style={styles.webSocketToggleContainer}>
+        <Text style={styles.webSocketToggleLabel}>啟用即時語音識別:</Text>
+        <Switch
+          value={useWebSocket}
+          onValueChange={setUseWebSocket}
+          disabled={isRecording}
+          trackColor={{ false: '#767577', true: '#81b0ff' }}
+          thumbColor={useWebSocket ? '#4285F4' : '#f4f3f4'}
+        />
+      </View>
+      
       <View style={styles.recordButtonContainer}>
-        <TouchableOpacity 
-          style={[styles.iconButton, isRecording ? styles.recordingButton : styles.recordButton]}
-          onPress={isRecording ? stopRecording : startRecording}
-          disabled={isPlaying}
-        >
-          <IconSymbol 
-            name={isRecording ? "stop" : "mic"} 
-            size={30} 
-            color="white" 
-          />
-        </TouchableOpacity>
+      <TouchableOpacity 
+        style={[
+          styles.iconButton, 
+          isRecording ? styles.recordingButton : styles.recordButton,
+          (useWebSocket && webSocketStatus === 'connecting') ? styles.disabledButton : {}
+        ]}
+        onPress={handleRecordButtonPress}
+        disabled={isPlaying || (useWebSocket && webSocketStatus === 'connecting')}
+      >
+        <IconSymbol 
+          name={isRecording ? "stop" : "mic"} 
+          size={30} 
+          color={(useWebSocket && webSocketStatus === 'connecting') ? "#999" : "white"} 
+        />
+      </TouchableOpacity>
         <Text style={styles.buttonLabel}>
           {isRecording ? "停止錄音" : "開始錄音"}
         </Text>
@@ -428,6 +375,27 @@ export default function AudioRecorderScreen() {
         </View>
       )}
       
+      {/* 識別結果顯示區域 - 始終顯示 */}
+      <View style={styles.recognizedTextContainer}>
+        <View style={styles.recognizedTextHeader}>
+          <Text style={styles.recognizedTextTitle}>識別結果:</Text>
+          {isTranscribing && (
+            <View style={styles.transcribingIndicator}>
+              <Text style={styles.transcribingText}>識別中...</Text>
+            </View>
+          )}
+        </View>
+        <ScrollView 
+          ref={scrollViewRef}
+          style={styles.recognizedTextBox}
+          contentContainerStyle={styles.recognizedTextContent}
+        >
+          <Text style={styles.recognizedTextValue}>
+            {recognizedText || '等待開始錄音...'}
+          </Text>
+        </ScrollView>
+      </View>
+      
       <Text style={styles.backgroundNote}>
         {isRecording ? "錄音將在背景繼續進行" : ""}
       </Text>
@@ -436,6 +404,10 @@ export default function AudioRecorderScreen() {
 }
 
 const styles = StyleSheet.create({
+  disabledButton: {
+    backgroundColor: '#cccccc',
+    opacity: 0.7,
+  },
   container: {
     flex: 1,
     justifyContent: 'center',
@@ -445,8 +417,39 @@ const styles = StyleSheet.create({
   },
   statusText: {
     fontSize: 18,
-    marginBottom: 30,
+    marginBottom: 20,
     color: '#333',
+    fontWeight: '500',
+  },
+  webSocketStatusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  webSocketStatusLabel: {
+    fontSize: 14,
+    color: '#555',
+    marginRight: 8,
+  },
+  statusIndicator: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 5,
+  },
+  webSocketStatusText: {
+    fontSize: 14,
+    color: '#555',
+  },
+  webSocketToggleContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  webSocketToggleLabel: {
+    fontSize: 14,
+    color: '#555',
+    marginRight: 10,
   },
   recordButtonContainer: {
     alignItems: 'center',
@@ -513,6 +516,49 @@ const styles = StyleSheet.create({
     color: '#666',
     width: 40,
     textAlign: 'center',
+  },
+  recognizedTextContainer: {
+    width: '100%',
+    marginTop: 20,
+    padding: 10,
+    maxHeight: 200,
+  },
+  recognizedTextHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  recognizedTextTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  transcribingIndicator: {
+    backgroundColor: '#FBBC05',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  transcribingText: {
+    fontSize: 12,
+    color: '#333',
+  },
+  recognizedTextBox: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    maxHeight: 150,
+  },
+  recognizedTextContent: {
+    paddingBottom: 10,
+  },
+  recognizedTextValue: {
+    fontSize: 14,
+    color: '#333',
+    lineHeight: 20,
   },
   backgroundNote: {
     marginTop: 20,
