@@ -18,12 +18,14 @@ export default function AudioRecorderScreen() {
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
   const [recordingDuration, setRecordingDuration] = useState(0);
+  const [wsStatus, setWsStatus] = useState('未連接'); // WebSocket 狀態
   
   // 使用 useRef 來保存 Sound 對象，確保它在組件重新渲染時不會丟失
   const sound = useRef<Sound | null>(null);
   const playbackTimer = useRef<number | null>(null);
   const recordingTimer = useRef<number | null>(null);
   const appState = useRef(AppState.currentState);
+  const webSocket = useRef<WebSocket | null>(null); // 用於保存 WebSocket 連線
 
   useEffect(() => {
     setupNotifications();
@@ -48,6 +50,9 @@ export default function AudioRecorderScreen() {
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
 
+    // 初始化 WebSocket 連線
+    initWebSocket();
+
     // 組件卸載時清理
     return () => {
       if (isRecording) {
@@ -69,6 +74,9 @@ export default function AudioRecorderScreen() {
       // 清理臨時文件
       cleanupTempFile();
 
+      // 清理 WebSocket 連線
+      cleanupWebSocket();
+
       subscription.remove();
 
       if (Platform.OS === 'android') {
@@ -76,6 +84,55 @@ export default function AudioRecorderScreen() {
       }
     };
   }, []);
+
+  // 初始化 WebSocket 連線
+  const initWebSocket = () => {
+    try {
+      // 清理現有連線（如果有）
+      cleanupWebSocket();
+      
+      // 建立新連線
+      const wsUrl = 'wss://medbobi-api.bdlai.net/v1/AI/audioInference/multilingual';
+      webSocket.current = new WebSocket(wsUrl);
+      
+      // 設置事件處理器
+      webSocket.current.onopen = () => {
+        console.log('WebSocket 連線已建立');
+        setWsStatus('已連接');
+      };
+      
+      webSocket.current.onmessage = (event) => {
+        console.log('收到 WebSocket 訊息:', event.data);
+        // 這裡可以處理從伺服器收到的訊息
+      };
+      
+      webSocket.current.onerror = (error) => {
+        console.error('WebSocket 錯誤:', error);
+        setWsStatus('連接錯誤');
+      };
+      
+      webSocket.current.onclose = (event) => {
+        console.log('WebSocket 連線已關閉:', event.code, event.reason);
+        setWsStatus('已斷開');
+      };
+      
+    } catch (error) {
+      console.error('初始化 WebSocket 失敗:', error);
+      setWsStatus('初始化失敗');
+    }
+  };
+
+  // 清理 WebSocket 連線
+  const cleanupWebSocket = () => {
+    if (webSocket.current) {
+      if (webSocket.current.readyState === WebSocket.OPEN || 
+          webSocket.current.readyState === WebSocket.CONNECTING) {
+        webSocket.current.close();
+      }
+      webSocket.current = null;
+      setWsStatus('已斷開');
+    }
+  };
 
   const setupNotifications = () => {
     PushNotification.configure({
@@ -173,6 +230,18 @@ export default function AudioRecorderScreen() {
       if (Platform.OS === 'android') {
         await startForegroundService();
       }
+      
+      // 確保 WebSocket 連線已建立
+      if (!webSocket.current || webSocket.current.readyState !== WebSocket.OPEN) {
+        initWebSocket();
+      }
+      
+      // 添加 data 監聽器，用於獲取音訊數據
+      AudioRecord.on('data', (data) => {
+        // 這裡可以獲取到原始音訊數據（二進制格式）
+        console.log('收到音訊數據，大小:', data.length);
+        // 目前不傳送數據到 WebSocket
+      });
       
       AudioRecord.start();
       setIsRecording(true);
@@ -366,6 +435,10 @@ export default function AudioRecorderScreen() {
             : '就緒'}
       </Text>
       
+      <Text style={styles.wsStatusText}>
+        WebSocket: {wsStatus}
+      </Text>
+      
       <View style={styles.recordButtonContainer}>
         <TouchableOpacity 
           style={[styles.iconButton, isRecording ? styles.recordingButton : styles.recordButton]}
@@ -445,8 +518,13 @@ const styles = StyleSheet.create({
   },
   statusText: {
     fontSize: 18,
-    marginBottom: 30,
+    marginBottom: 10,
     color: '#333',
+  },
+  wsStatusText: {
+    fontSize: 14,
+    marginBottom: 20,
+    color: '#666',
   },
   recordButtonContainer: {
     alignItems: 'center',
