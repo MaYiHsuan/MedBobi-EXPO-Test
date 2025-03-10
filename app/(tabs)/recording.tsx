@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, TouchableOpacity, Text, Alert, Platform, PermissionsAndroid, StyleSheet, AppState, AppStateStatus } from 'react-native';
+import { View, TouchableOpacity, Text, Alert, Platform, PermissionsAndroid, StyleSheet, AppState, AppStateStatus, Share, TextInput } from 'react-native';
 import AudioRecord from 'react-native-audio-record';
 import Sound from 'react-native-sound';
 import * as FileSystem from 'expo-file-system';
@@ -19,6 +19,8 @@ export default function AudioRecorderScreen() {
   const [audioDuration, setAudioDuration] = useState(0);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [wsStatus, setWsStatus] = useState('未連接'); // WebSocket 狀態
+  const [wsStatusMessage, setWsStatusMessage] = useState(''); // WebSocket 狀態訊息
+  const [wsMessage, setWsMessage] = useState(''); // WebSocket 回傳訊息
   
   // 使用 useRef 來保存 Sound 對象，確保它在組件重新渲染時不會丟失
   const sound = useRef<Sound | null>(null);
@@ -33,7 +35,7 @@ export default function AudioRecorderScreen() {
     
     // 設置音頻錄製選項 - 使用臨時目錄
     const options = {
-      sampleRate: 44100,
+      sampleRate: 16000,
       channels: 1,
       bitsPerSample: 16,
       wavFile: 'temp_recording.wav',
@@ -86,7 +88,7 @@ export default function AudioRecorderScreen() {
   }, []);
 
   // 初始化 WebSocket 連線
-  const initWebSocket = () => {
+  const initWebSocket = async() => {
     try {
       // 清理現有連線（如果有）
       cleanupWebSocket();
@@ -99,40 +101,100 @@ export default function AudioRecorderScreen() {
       webSocket.current.onopen = () => {
         console.log('WebSocket 連線已建立');
         setWsStatus('已連接');
+        setWsStatusMessage(''); // 清除之前的狀態訊息
       };
-      
+
       webSocket.current.onmessage = (event) => {
         console.log('收到 WebSocket 訊息:', event.data);
-        // 這裡可以處理從伺服器收到的訊息
+        setWsMessage(prevMessage => prevMessage + event.data + '\n');
       };
-      
+
       webSocket.current.onerror = (error) => {
         console.error('WebSocket 錯誤:', error);
         setWsStatus('連接錯誤');
+        setWsStatusMessage(getErrorMessage(error));
       };
-      
+
       webSocket.current.onclose = (event) => {
-        console.log('WebSocket 連線已關閉:', event.code, event.reason);
+        let message = '';
+        switch (event.code) {
+          case 1000:
+            message = '正常關閉';
+            break;
+          case 1001:
+            message = '終端離開';
+            break;
+          case 1002:
+            message = '協定錯誤';
+            break;
+          case 1003:
+            message = '不支援的資料';
+            break;
+          case 1007:
+            message = '無效的資料';
+            break;
+          case 1008:
+            message = '違反政策';
+            break;
+          case 1009:
+            message = '訊息太大';
+            break;
+          case 1011:
+            message = '伺服器內部錯誤';
+            break;
+          default:
+            message = `未知錯誤 (Code: ${event.code})`;
+        }
+        console.log(`WebSocket 連線已關閉: ${event.code} - ${message}`);
         setWsStatus('已斷開');
+        setWsStatusMessage(`關閉原因：${message}`); // 設定關閉原因
+        
+        // 如果不是正常關閉，嘗試重新連線
+        if(event.code !== 1000){
+            setTimeout(() => {
+                initWebSocket();
+            }, 3000);  // 3秒後重新連接
+        }
       };
-      
     } catch (error) {
       console.error('初始化 WebSocket 失敗:', error);
       setWsStatus('初始化失敗');
+      setWsStatusMessage((error as Error).message || '未知錯誤');
     }
+
+    const getErrorMessage = (error: Event) => {
+      if (typeof error === 'string') {
+        return error;
+      } else if (error && typeof error.toString === 'function') {
+        // 嘗試呼叫 toString() 方法
+        const errorString = error.toString();
+        if (errorString !== '[object Object]') { // 檢查是否為預設的物件字串表示
+          return errorString;
+        }
+      }
+      return '未知錯誤';
+    };
   };
 
   // 清理 WebSocket 連線
   const cleanupWebSocket = () => {
     if (webSocket.current) {
-      if (webSocket.current.readyState === WebSocket.OPEN || 
-          webSocket.current.readyState === WebSocket.CONNECTING) {
-        webSocket.current.close();
+      try {
+        // 避免在 CLOSING 或 CLOSED 狀態下呼叫 close()
+        if (webSocket.current.readyState === WebSocket.OPEN || webSocket.current.readyState === WebSocket.CONNECTING)
+        {
+            webSocket.current.close(1000, "Client initiated close"); // 使用 1000 正常關閉
+        }
+      } catch (e)
+      {
+          console.error("Error closing WebSocket:", e);
       }
       webSocket.current = null;
       setWsStatus('已斷開');
+      setWsStatusMessage(''); // 清除狀態訊息
     }
   };
+
 
   const setupNotifications = () => {
     PushNotification.configure({
@@ -233,14 +295,53 @@ export default function AudioRecorderScreen() {
       
       // 確保 WebSocket 連線已建立
       if (!webSocket.current || webSocket.current.readyState !== WebSocket.OPEN) {
-        initWebSocket();
+        await initWebSocket();
       }
       
       // 添加 data 監聽器，用於獲取音訊數據
       AudioRecord.on('data', (data) => {
-        // 這裡可以獲取到原始音訊數據（二進制格式）
-        console.log('收到音訊數據，大小:', data.length);
-        // 目前不傳送數據到 WebSocket
+        // 檢查 WebSocket 連線狀態
+        if (webSocket.current && webSocket.current.readyState === WebSocket.OPEN) {
+          try {
+            // 複製數據並轉換
+            // 假設 data 是 base64 字符串
+            // 1. 將 base64 字符串解碼為二進制字符串
+            const binaryString = atob(data);
+            
+            // 2. 創建一個與二進制字符串長度相同的 Uint8Array
+            const uint8Array = new Uint8Array(binaryString.length);
+            
+            // 3. 將二進制字符串中的每個字符轉換為其 Unicode 編碼，並存儲在 Uint8Array 中
+            for (let i = 0; i < binaryString.length; i++) {
+              uint8Array[i] = binaryString.charCodeAt(i);
+            }
+            
+            // 4. 將 Uint8Array 轉換為 Float32Array
+            //    由於 react-native-audio-record 預設輸出 16-bit PCM，
+            //    我們需要將 Uint8Array 轉換為 Int16Array，然後再轉換為 Float32Array
+            const int16Array = new Int16Array(uint8Array.buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            
+            for (let i = 0; i < int16Array.length; i++) {
+              float32Array[i] = int16Array[i] / 32768.0; // 將 Int16 範圍 (-32768 to 32767) 映射到 Float32 範圍 (-1 to 1)
+            }
+            
+            // 5. 驗證數據類型 - 在控制台中打印數據類型和部分數據
+            // console.log('音訊數據類型:', float32Array.constructor.name);
+            // console.log('部分音訊數據:', float32Array.slice(0, 10));
+            
+            // 6. 從 Float32Array 創建 ArrayBuffer
+            const arrayBuffer = float32Array.buffer;
+            
+            // 7. 發送 ArrayBuffer 到 WebSocket 伺服器
+            webSocket.current.send(arrayBuffer);
+        
+          } catch (error) {
+            console.error('發送音訊數據到 WebSocket 時出錯:', error);
+          }
+        } else {
+          console.log('WebSocket 未連接，無法發送音訊數據');
+        }
       });
       
       AudioRecord.start();
@@ -272,6 +373,24 @@ export default function AudioRecorderScreen() {
       console.error('開始錄音失敗:', error);
       Alert.alert('錄音錯誤', '無法開始錄音');
       stopForegroundService();
+    }
+  };
+
+
+  const shareAudioFile = async () => {
+    if (!audioFile) {
+      Alert.alert('錯誤', '沒有可分享的音訊檔案');
+      return;
+    }
+  
+    try {
+      await Share.share({
+        url: audioFile, // 檔案的 URL
+        title: '分享音訊檔案', // 分享對話框的標題
+      });
+    } catch (error) {
+      console.error('分享失敗:', error);
+      Alert.alert('錯誤', '分享音訊檔案時出錯');
     }
   };
 
@@ -324,7 +443,6 @@ export default function AudioRecorderScreen() {
         Alert.alert('播放錯誤', '無法加載音頻文件');
         return;
       }
-      
       // 獲取音頻時長
       const duration = sound.current?.getDuration() || 0;
       setAudioDuration(duration);
@@ -470,9 +588,6 @@ export default function AudioRecorderScreen() {
                 color="white" 
               />
             </TouchableOpacity>
-            <Text style={styles.buttonLabel}>
-              {isPlaying ? "暫停" : "播放"}
-            </Text>
           </View>
           
           <View style={styles.progressContainer}>
@@ -498,9 +613,17 @@ export default function AudioRecorderScreen() {
           >
             <IconSymbol name="trash" size={20} color="white" />
           </TouchableOpacity>
+          {/* <TouchableOpacity onPress={shareAudioFile} style={[styles.iconButton]}>
+            <IconSymbol name="arrow.down" size={20} color="black" />
+          </TouchableOpacity> */}
         </View>
       )}
-      
+      <TextInput
+            style={styles.textInput}
+            multiline={true}
+            value={wsMessage}
+            onChangeText={setWsMessage} // 允許使用者編輯
+          />
       <Text style={styles.backgroundNote}>
         {isRecording ? "錄音將在背景繼續進行" : ""}
       </Text>
@@ -509,6 +632,15 @@ export default function AudioRecorderScreen() {
 }
 
 const styles = StyleSheet.create({
+  textInput: {
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 4,
+    padding: 10,
+    marginTop: 10,
+    height: 100, // 設定高度
+    width: '95%', // 設定寬度
+  },
   container: {
     flex: 1,
     justifyContent: 'center',
@@ -550,8 +682,8 @@ const styles = StyleSheet.create({
   },
   playButton: {
     backgroundColor: '#34A853',
-    width: 50,
-    height: 50,
+    width: 40,
+    height: 40,
     borderRadius: 25,
   },
   deleteButton: {
@@ -559,7 +691,6 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    marginTop: 20,
   },
   buttonLabel: {
     marginTop: 8,
@@ -568,17 +699,18 @@ const styles = StyleSheet.create({
   },
   playbackContainer: {
     width: '100%',
-    alignItems: 'center',
     marginTop: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   playControlsContainer: {
     alignItems: 'center',
-    marginBottom: 15,
   },
   progressContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    width: '100%',
+    width: '70%',
     paddingHorizontal: 10,
   },
   progressBar: {
